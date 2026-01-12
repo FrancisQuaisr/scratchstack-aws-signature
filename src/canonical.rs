@@ -12,6 +12,7 @@ use {
         auth::{SigV4Authenticator, SigV4AuthenticatorBuilder},
         chronoutil::ParseISO8601,
         crypto::{sha256, sha256_hex, SHA256_OUTPUT_LEN},
+        stored_body::StoredBody,
         SignatureError, SignatureOptions,
     },
     bytes::Bytes,
@@ -19,9 +20,9 @@ use {
     encoding::{all::UTF_8, label::encoding_from_whatwg_label, types::DecoderTrap},
     http::{
         header::{HeaderMap, HeaderValue},
-        request::Parts,
-        uri::Uri,
+        request::Request,
     },
+    http_body_util::combinators::BoxBody,
     lazy_static::lazy_static,
     log::trace,
     qualifier_attr::qualifiers,
@@ -146,6 +147,12 @@ const X_AMZ_SIGNED_HEADERS: &str = "X-Amz-SignedHeaders";
 /// Token used for X-Amz-Content-Sha256 when payload is unsigned
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
+/// Token used for X-Amz-Content-Sha256 when payload consists of signed chunks
+const SIGNED_PAYLOAD_STREAMING: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+/// String representation of the SHA256 hash of an empty payload
+const SHA256_EMPTY_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
 lazy_static! {
     /// Multiple slash pattern for condensing URIs
     static ref MULTISLASH: Regex = Regex::new("//+").unwrap();
@@ -202,8 +209,51 @@ struct CanonicalRequest {
     /// The encoding of header values is Latin 1 (ISO 8859-1), apart from a few oddities like Content-Disposition.
     headers: HashMap<String, Vec<Vec<u8>>>,
 
-    /// The SHA-256 hash of the body. `None` indicates an unsigned payload.
-    body_sha256: Option<String>,
+    /// The claim the request makes about the body.
+    body_claim: BodyContentClaim,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum BodyContentClaim {
+    Unsigned,
+    Sha256(String),
+    Sha256Streaming,
+}
+
+pub enum BodyError<E> {
+    Signature(SignatureError),
+    Inner(E),
+}
+
+impl std::fmt::Display for BodyContentClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyContentClaim::Unsigned => write!(f, "{}", UNSIGNED_PAYLOAD),
+            BodyContentClaim::Sha256(hash) => write!(f, "{}", hash),
+            BodyContentClaim::Sha256Streaming => write!(f, "{}", SIGNED_PAYLOAD_STREAMING),
+        }
+    }
+}
+
+impl std::str::FromStr for BodyContentClaim {
+    type Err = SignatureError;
+
+    fn from_str(value: &str) -> Result<BodyContentClaim, SignatureError> {
+        match value {
+            UNSIGNED_PAYLOAD => Ok(BodyContentClaim::Unsigned),
+            SIGNED_PAYLOAD_STREAMING => Ok(BodyContentClaim::Sha256Streaming),
+            _ => {
+                if value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit() && c.is_ascii_lowercase()) {
+                    Ok(BodyContentClaim::Sha256(value.to_string()))
+                } else {
+                    Err(SignatureError::IncompleteSignature(format!(
+                        "Content value was not a SHA256 value nor recognized keyword: {}",
+                        value
+                    )))
+                }
+            }
+        }
+    }
 }
 
 impl CanonicalRequest {
@@ -211,90 +261,125 @@ impl CanonicalRequest {
     #[cfg_attr(doc, doc(cfg(feature = "unstable")))]
     #[cfg_attr(any(doc, feature = "unstable"), qualifiers(pub))]
     #[cfg_attr(not(any(doc, feature = "unstable")), qualifiers(pub(crate)))]
-    fn from_request_parts(
-        mut parts: Parts,
-        mut body: Bytes,
+    async fn from_request_parts<B>(
+        request: Request<B>,
         options: SignatureOptions,
-    ) -> Result<(Self, Parts, Bytes), SignatureError> {
+    ) -> Result<(Self, Request<BoxBody<B::Data, B::Error>>), SignatureError>
+    where
+        B: http_body::Body + std::marker::Sync + std::marker::Send + 'static,
+        B::Data: Unpin + Sync + Send,
+        B::Error: std::error::Error + std::marker::Sync + std::marker::Send + 'static + Unpin,
+    {
+        let (parts, body) = request.into_parts();
         let canonical_path = canonicalize_uri_path(parts.uri.path(), options.s3)?;
         let content_type = get_content_type_and_charset(&parts.headers);
         let mut query_parameters = query_string_to_normalized_map(parts.uri.query().unwrap_or(""))?;
 
-        if options.url_encode_form {
-            // Treat requests with application/x-www-form-urlencoded bodies as if they were passed into the query string.
-            if let Some(content_type) = content_type {
-                if content_type.content_type == APPLICATION_X_WWW_FORM_URLENCODED {
-                    trace!("Body is application/x-www-form-urlencoded; converting to query parameters");
-
-                    let encoding = match &content_type.charset {
-                        Some(charset) => match encoding_from_whatwg_label(charset.as_str()) {
-                            Some(encoding) => encoding,
-                            None => {
-                                return Err(SignatureError::InvalidBodyEncoding(format!(
-                                    "application/x-www-form-urlencoded body uses unsupported charset '{}'",
-                                    charset
-                                )))
-                            }
-                        },
-                        None => {
-                            trace!("Falling back to UTF-8 for application/x-www-form-urlencoded body");
-                            UTF_8
-                        }
-                    };
-
-                    let body_query = match encoding.decode(&body, DecoderTrap::Strict) {
-                        Ok(body) => body,
-                        Err(_) => {
-                            return Err(SignatureError::InvalidBodyEncoding(format!(
-                            "Invalid body data encountered parsing application/x-www-form-urlencoded with charset '{}'",
-                            encoding.whatwg_name().unwrap_or(encoding.name())
-                        )))
-                        }
-                    };
-
-                    query_parameters.extend(query_string_to_normalized_map(body_query.as_str())?);
-                    // Rebuild the parts URI with the new query string.
-                    let qs = canonicalize_query_to_string(&query_parameters);
-                    trace!("Rebuilding URI with new query string: {}", qs);
-
-                    let mut pq = canonical_path.clone();
-                    if !qs.is_empty() {
-                        pq.push('?');
-                        pq.push_str(&qs);
-                    }
-
-                    parts.uri =
-                        Uri::builder().path_and_query(pq).build().expect("failed to rebuild URI with new query string");
-                    body = Bytes::from("");
-                }
-            }
-        }
-
-        let headers = normalize_headers(&parts.headers);
         let is_presigned_url =
             [X_AMZ_ALGORITHM, X_AMZ_CREDENTIAL, X_AMZ_DATE, X_AMZ_EXPIRES, X_AMZ_SIGNED_HEADERS, X_AMZ_SIGNATURE]
                 .into_iter()
                 .all(|p| query_parameters.contains_key(p));
-        let payload_is_unsigned = is_presigned_url
-            || query_parameters.get(X_AMZ_CONTENT_SHA256).and_then(|values| values.first()).map(String::as_str)
-                == Some(UNSIGNED_PAYLOAD);
-        let body_sha256 = if payload_is_unsigned {
-            None
+
+        let mut body: BoxBody<B::Data, B::Error> = BoxBody::new(body);
+        let mut body_data: Option<Bytes> = None;
+
+        let mut body_claim = if is_presigned_url {
+            BodyContentClaim::Unsigned
         } else {
-            Some(sha256_hex(body.as_ref()))
+            use std::str::FromStr as _;
+
+            let payload_sig_header_val = query_parameters.get(X_AMZ_CONTENT_SHA256).and_then(|values| values.first());
+            if let Some(payload_sig_header_val) = payload_sig_header_val {
+                BodyContentClaim::from_str(&payload_sig_header_val)?
+            } else {
+                let (body_bytes, stored_body) = Self::fetch_body(body).await.map_err(SignatureError::IO)?;
+                let claim = BodyContentClaim::Sha256(sha256_hex(&body_bytes));
+                body_data = Some(body_bytes);
+                body = stored_body;
+                claim
+            }
         };
+
+        let url_encode_form_content_type =
+            content_type.filter(|c| options.url_encode_form && c.content_type == APPLICATION_X_WWW_FORM_URLENCODED);
+
+        if let Some(content_type) = url_encode_form_content_type {
+            // Treat requests with application/x-www-form-urlencoded bodies as if they were passed into the query string.
+            trace!("Body is application/x-www-form-urlencoded; converting to query parameters");
+
+            let encoding = match &content_type.charset {
+                Some(charset) => match encoding_from_whatwg_label(charset.as_str()) {
+                    Some(encoding) => encoding,
+                    None => {
+                        return Err(SignatureError::InvalidBodyEncoding(format!(
+                            "application/x-www-form-urlencoded body uses unsupported charset '{}'",
+                            charset
+                        )))
+                    }
+                },
+                None => {
+                    trace!("Falling back to UTF-8 for application/x-www-form-urlencoded body");
+                    UTF_8
+                }
+            };
+
+            let body_data: &Bytes = if let Some(ref body_data) = body_data {
+                body_data
+            } else {
+                let (bytes, stored_body) = Self::fetch_body(body).await.map_err(SignatureError::IO)?;
+                body = stored_body;
+                body_data.get_or_insert(bytes)
+            };
+
+            let body_query = match encoding.decode(&body_data, DecoderTrap::Strict) {
+                Ok(body) => body,
+                Err(_) => {
+                    return Err(SignatureError::InvalidBodyEncoding(format!(
+                        "Invalid body data encountered parsing application/x-www-form-urlencoded with charset '{}'",
+                        encoding.whatwg_name().unwrap_or(encoding.name())
+                    )))
+                }
+            };
+
+            query_parameters.extend(query_string_to_normalized_map(body_query.as_str())?);
+            // Rebuild the parts URI with the new query string.
+            let qs = canonicalize_query_to_string(&query_parameters);
+            trace!("Rebuilding URI with new query string: {}", qs);
+
+            let mut pq = canonical_path.clone();
+            if !qs.is_empty() {
+                pq.push('?');
+                pq.push_str(&qs);
+            }
+
+            body_claim = BodyContentClaim::Sha256(SHA256_EMPTY_HASH.into());
+        };
+
+        let headers = normalize_headers(&parts.headers);
+        let request_method = parts.method.to_string();
+        let rebuilt_request = Request::from_parts(parts, body);
 
         Ok((
             CanonicalRequest {
-                request_method: parts.method.to_string(),
+                request_method,
                 canonical_path,
                 query_parameters,
                 headers,
-                body_sha256,
+                body_claim,
             },
-            parts,
-            body,
+            rebuilt_request,
         ))
+    }
+
+    async fn fetch_body<B: http_body::Body>(body: B) -> Result<(Bytes, BoxBody<B::Data, B::Error>), std::io::Error>
+    where
+        B::Data: Unpin + Sync + Send + 'static,
+        B::Error: Send + Sync + Unpin + std::error::Error + 'static,
+    {
+        let stored_body =
+            StoredBody::try_from_async(body).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let body_data = stored_body.to_bytes();
+        Ok((body_data, BoxBody::new(stored_body)))
     }
 
     /// Retrieve the HTTP request method.
@@ -335,13 +420,13 @@ impl CanonicalRequest {
         &self.headers
     }
 
-    /// Retrieve the SHA-256 hash of the request body.
+    /// Retrieve what the request claims about the content body
     #[cfg_attr(doc, doc(cfg(feature = "unstable")))]
     #[cfg_attr(any(doc, feature = "unstable"), qualifiers(pub))]
     #[cfg_attr(not(any(doc, feature = "unstable")), qualifiers(pub(crate)))]
     #[inline(always)]
-    fn body_sha256(&self) -> Option<&str> {
-        self.body_sha256.as_deref()
+    fn body_claim(&self) -> &BodyContentClaim {
+        &self.body_claim
     }
 
     /// Get the canonical query string from the request.
@@ -385,7 +470,7 @@ impl CanonicalRequest {
         result.push(b'\n');
         result.extend(signed_headers.join(";").as_bytes());
         result.push(b'\n');
-        result.extend(self.body_sha256().as_deref().unwrap_or(UNSIGNED_PAYLOAD).as_bytes());
+        result.extend(self.body_claim().to_string().as_bytes());
 
         trace!("Canonical request:\n{}", String::from_utf8_lossy(&result));
 
@@ -700,7 +785,7 @@ impl Debug for CanonicalRequest {
             .field("canonical_path", &self.canonical_path)
             .field("query_parameters", &self.query_parameters)
             .field("headers", &headers)
-            .field("body_sha256", &self.body_sha256)
+            .field("body_claim", &self.body_claim)
             .finish()
     }
 }
@@ -1364,8 +1449,10 @@ mod tests {
         crate::{
             canonical::{
                 canonicalize_query_to_string, canonicalize_uri_path, normalize_uri_path_component,
-                query_string_to_normalized_map, unescape_uri_encoding, CanonicalRequest,
+                query_string_to_normalized_map, unescape_uri_encoding, BodyContentClaim, CanonicalRequest,
+                SHA256_EMPTY_HASH,
             },
+            signature::IntoHttpBody as _,
             SignatureError, SignatureOptions, NO_ADDITIONAL_SIGNED_HEADERS,
         },
         bytes::Bytes,
@@ -1513,8 +1600,8 @@ mod tests {
         _query: u16,
     }
 
-    #[test_log::test]
-    fn normalize_invalid_hex_path_cr() {
+    #[test_log::test(tokio::test)]
+    async fn normalize_invalid_hex_path_cr() {
         // The HTTP crate does its own validation; we need to hack into it to force invalid URI elements in there.
         for (path, error_message) in [
             ("/abcd%yy", "Illegal hex character in escape % pattern: %yy"),
@@ -1543,19 +1630,19 @@ mod tests {
                 .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
                 .header("authorization", "Basic foobar")
                 .header("x-amz-date", "20150830T123600Z")
-                .body(Bytes::new())
+                .body(().into_http_body())
                 .unwrap();
-            let (parts, body) = request.into_parts();
 
-            let e = CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap_err();
+            let e =
+                CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap_err();
             if let SignatureError::InvalidURIPath(msg) = e {
                 assert_eq!(msg.as_str(), error_message);
             }
         }
     }
 
-    #[test_log::test]
-    fn normalize_invalid_hex_query_cr() {
+    #[test_log::test(tokio::test)]
+    async fn normalize_invalid_hex_query_cr() {
         // The HTTP crate does its own validation; we need to hack into it to force invalid URI elements in there.
         for (path, error_message) in [
             ("/?x=abcd%yy", "Illegal hex character in escape % pattern: %yy"),
@@ -1583,11 +1670,11 @@ mod tests {
                 .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
                 .header("authorization", "Basic foobar")
                 .header("x-amz-date", "20150830T123600Z")
-                .body(Bytes::new())
+                .body(().into_http_body())
                 .unwrap();
-            let (parts, body) = request.into_parts();
 
-            let e = CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap_err();
+            let e =
+                CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap_err();
             if let SignatureError::MalformedQueryString(msg) = e {
                 assert_eq!(msg.as_str(), error_message);
             }
@@ -1606,8 +1693,8 @@ mod tests {
         assert_eq!(result["Key3"], vec!["Value3"]);
     }
 
-    #[test_log::test]
-    fn test_multiple_algorithms() {
+    #[test_log::test(tokio::test)]
+    async fn test_multiple_algorithms() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::GET)
@@ -1615,12 +1702,10 @@ mod tests {
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
             .header("authorization", "Basic foobar")
             .header("x-amz-date", "20150830T123600Z")
-            .body(Bytes::new())
+            .body(().into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
 
         // Ensure we can debug print the canonical request.
         let _ = format!("{:?}", cr);
@@ -1634,7 +1719,11 @@ mod tests {
             cr.headers().get("authorization").unwrap()[0],
             b"AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678"
         );
-        assert_eq!(cr.body_sha256(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        // TODO; Likely broken size the claim comes from the headers now.
+        assert_eq!(
+            cr.body_claim(),
+            &BodyContentClaim::Sha256("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into())
+        );
 
         let params = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap();
         // Ensure we can debug print the auth parameters.
@@ -1642,8 +1731,8 @@ mod tests {
         assert_eq!(params.signed_headers, vec!["date", "host"]);
     }
 
-    #[test_log::test]
-    fn test_bad_form_urlencoded_charset() {
+    #[test_log::test(tokio::test)]
+    async fn test_bad_form_urlencoded_charset() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::POST)
@@ -1651,11 +1740,10 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded; hello=world; charset=foobar")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
-            .body(Bytes::from_static(b"foo=ba\x80r"))
+            .body(Bytes::from_static(b"foo=ba\x80r").into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let e = CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap_err();
+        let e = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap_err();
         if let SignatureError::InvalidBodyEncoding(_) = e {
             assert_eq!(e.to_string(), "application/x-www-form-urlencoded body uses unsupported charset 'foobar'");
             assert_eq!(e.error_code(), "InvalidBodyEncoding");
@@ -1665,8 +1753,8 @@ mod tests {
         }
     }
 
-    #[test_log::test]
-    fn test_empty_form() {
+    #[test_log::test(tokio::test)]
+    async fn test_empty_form() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::POST)
@@ -1674,17 +1762,15 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
-            .body(Bytes::from_static(b""))
+            .body(Bytes::from_static(b"").into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         assert!(cr.query_parameters().is_empty());
     }
 
-    #[test_log::test]
-    fn test_default_form_encoding() {
+    #[test_log::test(tokio::test)]
+    async fn test_default_form_encoding() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::POST)
@@ -1692,12 +1778,10 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
-            .body(Bytes::from(b"foo=bar\xc3\xbf".to_vec()))
+            .body(Bytes::from(b"foo=bar\xc3\xbf".to_vec()).into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         assert_eq!(cr.query_parameters().get("foo").unwrap(), &vec!["bar%C3%BF".to_string()]);
 
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
@@ -1707,17 +1791,15 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded; hello=world")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
-            .body(Bytes::from(b"foo=bar\xc3\xbf".to_vec()))
+            .body(Bytes::from(b"foo=bar\xc3\xbf".to_vec()).into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         assert_eq!(cr.query_parameters().get("foo").unwrap(), &vec!["bar%C3%BF".to_string()]);
     }
 
-    #[test_log::test]
-    fn test_no_map_form() {
+    #[test_log::test(tokio::test)]
+    async fn test_no_map_form() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::POST)
@@ -1725,11 +1807,10 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
-            .body(Bytes::from(b"foo=bar\xc3\xbf".to_vec()))
+            .body(Bytes::from(b"foo=bar\xc3\xbf".to_vec()).into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let (cr, _, _) = CanonicalRequest::from_request_parts(parts, body, SignatureOptions::default()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::default()).await.unwrap();
         assert!(!cr.query_parameters().contains_key("foo"));
     }
 
@@ -1743,8 +1824,8 @@ mod tests {
         assert_eq!(debug_headers(&HashMap::new()), "");
     }
 
-    #[test_log::test]
-    fn test_bad_form_encoding() {
+    #[test_log::test(tokio::test)]
+    async fn test_bad_form_encoding() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::POST)
@@ -1752,11 +1833,10 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
-            .body(Bytes::from(b"foo=ba\x80r".to_vec()))
+            .body(Bytes::from(b"foo=ba\x80r".to_vec()).into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let e = CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap_err();
+        let e = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap_err();
         if let SignatureError::InvalidBodyEncoding(msg) = e {
             assert_eq!(
                 msg.as_str(),
@@ -1767,8 +1847,8 @@ mod tests {
         }
     }
 
-    #[test_log::test]
-    fn test_bad_form_charset_param() {
+    #[test_log::test(tokio::test)]
+    async fn test_bad_form_charset_param() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::POST)
@@ -1776,17 +1856,16 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded; charset")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
-            .body(Bytes::from(b"foo=bar".to_vec()))
+            .body(Bytes::from(b"foo=bar".to_vec()).into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let (_, _, body) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
-        assert_eq!(body.as_ref(), b"");
+        let (canonical, _) =
+            CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
+        assert_eq!(canonical.body_claim(), &BodyContentClaim::Sha256(SHA256_EMPTY_HASH.into()));
     }
 
-    #[test_log::test]
-    fn test_bad_form_urlencoding() {
+    #[test_log::test(tokio::test)]
+    async fn test_bad_form_urlencoding() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::POST)
@@ -1794,11 +1873,10 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
-            .body(Bytes::from(b"foo=bar%yy".to_vec()))
+            .body(Bytes::from(b"foo=bar%yy".to_vec()).into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let e = CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap_err();
+        let e = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap_err();
         if let SignatureError::MalformedQueryString(msg) = e {
             assert_eq!(msg.as_str(), "Illegal hex character in escape % pattern: %yy")
         } else {
@@ -1812,11 +1890,10 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
-            .body(Bytes::from(b"foo%tt=bar".to_vec()))
+            .body(Bytes::from(b"foo%tt=bar".to_vec()).into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let e = CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap_err();
+        let e = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap_err();
         if let SignatureError::MalformedQueryString(msg) = e {
             assert_eq!(msg.as_str(), "Illegal hex character in escape % pattern: %tt")
         } else {
@@ -1830,11 +1907,10 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=date;host, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
-            .body(Bytes::from(b"foo=bar%y".to_vec()))
+            .body(Bytes::from(b"foo=bar%y".to_vec()).into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let e = CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap_err();
+        let e = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap_err();
         if let SignatureError::MalformedQueryString(msg) = e {
             assert_eq!(msg.as_str(), "Incomplete trailing escape % sequence")
         } else {
@@ -1850,8 +1926,8 @@ mod tests {
         }
     }
 
-    #[test_log::test]
-    fn test_missing_auth_header_components() {
+    #[test_log::test(tokio::test)]
+    async fn test_missing_auth_header_components() {
         for i in 0..15 {
             let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
             let mut error_messages = Vec::with_capacity(4);
@@ -1886,11 +1962,10 @@ mod tests {
                 builder
             };
 
-            let request = builder.body(Bytes::new()).unwrap();
-            let (parts, body) = request.into_parts();
+            let request = builder.body(().into_http_body()).unwrap();
 
-            let (cr, _, _) =
-                CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+            let (cr, _) =
+                CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
             let e = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap_err();
             if let SignatureError::IncompleteSignature(msg) = e {
                 let error_message = format!("{} Authorization=AWS4-HMAC-SHA256", error_messages.join(" "));
@@ -1901,21 +1976,18 @@ mod tests {
         }
     }
 
-    #[test_log::test]
-    fn test_malformed_auth_header() {
+    #[test_log::test(tokio::test)]
+    async fn test_malformed_auth_header() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::GET)
             .uri(uri)
             .header("x-amz-date", "20150830T123600Z")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeadersdate;host")
-            .body(Bytes::new())
+            .body(().into_http_body())
             .unwrap();
 
-        let (parts, body) = request.into_parts();
-
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         let e = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap_err();
         if let SignatureError::IncompleteSignature(msg) = e {
             assert_eq!(msg.as_str(), "'SignedHeadersdate;host' not a valid key=value pair (missing equal-sign) in Authorization header: 'AWS4-HMAC-SHA256 Credential=1234, SignedHeadersdate;host'");
@@ -1924,8 +1996,8 @@ mod tests {
         }
     }
 
-    #[test_log::test]
-    fn test_missing_auth_query_components() {
+    #[test_log::test(tokio::test)]
+    async fn test_missing_auth_query_components() {
         for i in 0..15 {
             let mut error_messages = Vec::with_capacity(4);
             let mut auth_query = Vec::with_capacity(5);
@@ -1962,11 +2034,10 @@ mod tests {
             let uri = Uri::builder().path_and_query(pq).build().unwrap();
             let builder = Request::builder().method(Method::GET).uri(uri);
 
-            let request = builder.body(Bytes::new()).unwrap();
-            let (parts, body) = request.into_parts();
+            let request = builder.body(().into_http_body()).unwrap();
 
-            let (cr, _, _) =
-                CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+            let (cr, _) =
+                CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
             let e = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap_err();
             if let SignatureError::IncompleteSignature(msg) = e {
                 let error_message = format!("{} Re-examine the query-string parameters.", error_messages.join(" "));
@@ -1977,8 +2048,8 @@ mod tests {
         }
     }
 
-    #[test_log::test]
-    fn test_auth_component_ordering() {
+    #[test_log::test(tokio::test)]
+    async fn test_auth_component_ordering() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::GET)
@@ -1990,12 +2061,10 @@ mod tests {
             .header("x-amz-date", "20161231T235959Z")
             .header("x-amz-security-token", "Test1")
             .header("x-amz-security-token", "Test2")
-            .body(Bytes::new())
+            .body(().into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         let auth = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap();
         // Expect last component found
         assert_eq!(auth.builder.get_credential(), Some("ABCD"));
@@ -2010,12 +2079,10 @@ mod tests {
             .method(Method::GET)
             .uri(uri)
             .header("host", "example.amazonaws.com")
-            .body(Bytes::new())
+            .body(().into_http_body())
             .unwrap();
-        let (parts, body) = request.into_parts();
 
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         let auth = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap();
         // Expect first component found
         assert_eq!(auth.builder.get_credential(), Some("1234"));
@@ -2028,8 +2095,8 @@ mod tests {
         assert!(auth.is_ok());
     }
 
-    #[test_log::test]
-    fn test_signed_headers_missing_host() {
+    #[test_log::test(tokio::test)]
+    async fn test_signed_headers_missing_host() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::GET)
@@ -2037,13 +2104,10 @@ mod tests {
             .header("x-amz-date", "20150830T123600Z")
             .header("host", "example.amazonaws.com")
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=x-amz-date, Signature=5678")
-            .body(Bytes::new())
+            .body(().into_http_body())
             .unwrap();
 
-        let (parts, body) = request.into_parts();
-
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         let required_headers = NO_ADDITIONAL_SIGNED_HEADERS;
         let required_headers2 = required_headers;
         assert_eq!(&required_headers, &required_headers2);
@@ -2061,13 +2125,10 @@ mod tests {
             .method(Method::GET)
             .uri(uri)
             .header("host", "example.amazonaws.com")
-            .body(Bytes::new())
+            .body(().into_http_body())
             .unwrap();
 
-        let (parts, body) = request.into_parts();
-
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         let e = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap_err();
         if let SignatureError::SignatureDoesNotMatch(msg) = e {
             let msg = msg.expect("Expected error message");
@@ -2077,8 +2138,8 @@ mod tests {
         }
     }
 
-    #[test_log::test]
-    fn test_missing_signed_header() {
+    #[test_log::test(tokio::test)]
+    async fn test_missing_signed_header() {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::GET)
@@ -2089,21 +2150,18 @@ mod tests {
                 "authorization",
                 "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=a;host;x-amz-date, Signature=5678",
             )
-            .body(Bytes::new())
+            .body(().into_http_body())
             .unwrap();
 
-        let (parts, body) = request.into_parts();
-
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         let a = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap();
         assert_eq!(a.signed_headers, vec!["a", "host", "x-amz-date"]);
         let cr_bytes = cr.canonical_request(&a.signed_headers);
         assert!(!cr_bytes.is_empty());
     }
 
-    #[test_log::test]
-    fn test_bad_algorithms() {
+    #[test_log::test(tokio::test)]
+    async fn test_bad_algorithms() {
         // No algorithm present (rule 5)
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
@@ -2112,13 +2170,10 @@ mod tests {
             .header("content-type", "application/json")
             .header("x-amz-date", "20150830T123600Z")
             .header("host", "example.amazonaws.com")
-            .body(Bytes::from_static(b"{}"))
+            .body(Bytes::from_static(b"{}").into_http_body())
             .unwrap();
 
-        let (parts, body) = request.into_parts();
-
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         let e = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap_err();
         if let SignatureError::MissingAuthenticationToken(msg) = e {
             assert_eq!(msg.as_str(), "Request is missing Authentication Token");
@@ -2134,13 +2189,10 @@ mod tests {
             .header("authorization", "AWS4-HMAC-SHA256 Credential=1234, SignedHeaders=x-amz-date, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
             .header("host", "example.amazonaws.com")
-            .body(Bytes::new())
+            .body(().into_http_body())
             .unwrap();
 
-        let (parts, body) = request.into_parts();
-
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         let e = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap_err();
         if let SignatureError::SignatureDoesNotMatch(ref msg) = e {
             assert!(msg.is_none());
@@ -2157,13 +2209,10 @@ mod tests {
             .header("authorization", "AWS3-HMAC-SHA256 Credential=1234, SignedHeaders=x-amz-date, Signature=5678")
             .header("x-amz-date", "20150830T123600Z")
             .header("host", "example.amazonaws.com")
-            .body(Bytes::new())
+            .body(().into_http_body())
             .unwrap();
 
-        let (parts, body) = request.into_parts();
-
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         let e = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap_err();
         if let SignatureError::IncompleteSignature(msg) = e {
             assert_eq!(msg.as_str(), "Unsupported AWS 'algorithm': 'AWS3-HMAC-SHA256'.");
@@ -2178,13 +2227,10 @@ mod tests {
             .uri(uri)
             .header("x-amz-date", "20150830T123600Z")
             .header("host", "example.amazonaws.com")
-            .body(Bytes::new())
+            .body(().into_http_body())
             .unwrap();
 
-        let (parts, body) = request.into_parts();
-
-        let (cr, _, _) =
-            CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form()).unwrap();
+        let (cr, _) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form()).await.unwrap();
         let e = cr.get_auth_parameters(&NO_ADDITIONAL_SIGNED_HEADERS).unwrap_err();
         if let SignatureError::MissingAuthenticationToken(msg) = e {
             assert_eq!(msg.as_str(), "Request is missing Authentication Token");

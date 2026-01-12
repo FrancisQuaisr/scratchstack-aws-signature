@@ -5,7 +5,8 @@ use {
     },
     bytes::Bytes,
     chrono::{DateTime, Duration, Utc},
-    http::request::{Parts, Request},
+    http::request::Request,
+    http_body_util::combinators::BoxBody,
     log::trace,
     std::future::Future,
     tower::{BoxError, Service},
@@ -86,16 +87,16 @@ pub async fn sigv4_validate_request<B, G, F, S>(
     server_timestamp: DateTime<Utc>,
     required_headers: &S,
     options: SignatureOptions,
-) -> Result<(Parts, Bytes, SigV4AuthenticatorResponse), BoxError>
+) -> Result<(Request<BoxBody<B::Data, B::Error>>, SigV4AuthenticatorResponse), BoxError>
 where
-    B: IntoRequestBytes,
+    B: http_body::Body + std::marker::Sync + std::marker::Send + 'static,
+    B::Data: Unpin + Sync + Send,
+    B::Error: std::error::Error + std::marker::Sync + std::marker::Send + Unpin,
     G: Service<GetSigningKeyRequest, Response = GetSigningKeyResponse, Error = BoxError, Future = F> + Send,
     F: Future<Output = Result<GetSigningKeyResponse, BoxError>> + Send,
     S: SignedHeaderRequirements,
 {
-    let (parts, body) = request.into_parts();
-    let body = body.into_request_bytes().await?;
-    let (canonical_request, parts, body) = CanonicalRequest::from_request_parts(parts, body, options)?;
+    let (canonical_request, request) = CanonicalRequest::from_request_parts(request, options).await?;
     trace!("Created canonical request: {:?}", canonical_request);
     let auth = canonical_request.get_authenticator(required_headers)?;
     trace!("Created authenticator: {:?}", auth);
@@ -109,7 +110,32 @@ where
         )
         .await?;
 
-    Ok((parts, body, sigv4_response))
+    Ok((request, sigv4_response))
+}
+
+/// A trait for converting various body types into an HTTP body.
+pub trait IntoHttpBody {
+    /// The HTTP body type.
+    type Body: http_body::Body;
+
+    /// Converts to an HTTP body.
+    fn into_http_body(self) -> Self::Body;
+}
+
+impl IntoHttpBody for () {
+    type Body = http_body_util::Empty<Bytes>;
+
+    fn into_http_body(self) -> Self::Body {
+        http_body_util::Empty::new()
+    }
+}
+
+impl IntoHttpBody for Bytes {
+    type Body = http_body_util::Full<Bytes>;
+
+    fn into_http_body(self) -> Self::Body {
+        http_body_util::Full::new(self)
+    }
 }
 
 /// A trait for converting various body types into a [`Bytes`] object.
@@ -154,9 +180,9 @@ impl IntoRequestBytes for Bytes {
 mod tests {
     use {
         crate::{
-            auth::SigV4AuthenticatorResponse, service_for_signing_key_fn, sigv4_validate_request, GetSigningKeyRequest,
-            GetSigningKeyResponse, KSecretKey, SignatureError, SignatureOptions, SignedHeaderRequirements,
-            VecSignedHeaderRequirements, NO_ADDITIONAL_SIGNED_HEADERS,
+            auth::SigV4AuthenticatorResponse, service_for_signing_key_fn, signature::IntoHttpBody,
+            sigv4_validate_request, GetSigningKeyRequest, GetSigningKeyResponse, KSecretKey, SignatureError,
+            SignatureOptions, SignedHeaderRequirements, VecSignedHeaderRequirements, NO_ADDITIONAL_SIGNED_HEADERS,
         },
         bytes::Bytes,
         chrono::{DateTime, NaiveDate, Utc},
@@ -165,10 +191,11 @@ mod tests {
             request::{Parts, Request},
             uri::{PathAndQuery, Uri},
         },
+        http_body_util::combinators::BoxBody,
         lazy_static::lazy_static,
         scratchstack_aws_principal::{Principal, User},
         scratchstack_errors::ServiceError,
-        std::{borrow::Cow, str::FromStr},
+        std::{borrow::Cow, convert::Infallible, str::FromStr},
         tower::BoxError,
     };
 
@@ -220,7 +247,9 @@ mod tests {
         Ok(GetSigningKeyResponse::builder().principal(principal).signing_key(k_signing).build().unwrap())
     }
 
-    async fn run_auth_test(auth_str: &str) -> Result<(Parts, Bytes, SigV4AuthenticatorResponse), BoxError> {
+    async fn run_auth_test(
+        auth_str: &str,
+    ) -> Result<(Request<BoxBody<Bytes, Infallible>>, SigV4AuthenticatorResponse), BoxError> {
         let uri = Uri::builder().path_and_query(PathAndQuery::from_static("/")).build().unwrap();
         let request = Request::builder()
             .method(Method::GET)
@@ -228,7 +257,7 @@ mod tests {
             .header("authorization", auth_str)
             .header("host", "example.amazonaws.com")
             .header("x-amz-date", "20150830T123600Z")
-            .body(())
+            .body(().into_http_body())
             .unwrap();
         let mut get_signing_key_svc = service_for_signing_key_fn(get_signing_key);
         sigv4_validate_request(
@@ -260,7 +289,7 @@ mod tests {
             .uri(uri)
             .header("authorization", VALID_AUTH_HEADER)
             .header("host", "localhost")
-            .body(())
+            .body(().into_http_body())
             .unwrap();
         let e = expect_err!(
             sigv4_validate_request(
@@ -290,7 +319,7 @@ mod tests {
             .uri(uri)
             .header("authorization", VALID_AUTH_HEADER)
             .header("date", "zzzzzzzzz")
-            .body(())
+            .body(().into_http_body())
             .unwrap();
         let e = expect_err!(
             sigv4_validate_request(
@@ -371,7 +400,7 @@ mod tests {
                 _ => builder = builder.header("x-amz-date", "20150830T122100Z"),
             }
 
-            let request = builder.body(()).unwrap();
+            let request = builder.body(().into_http_body()).unwrap();
             let mut required_headers = VecSignedHeaderRequirements::default();
             required_headers.add_always_present("Content-Type");
             required_headers.add_always_present("Qwerty");
@@ -540,7 +569,7 @@ mod tests {
 
             let body = Bytes::from_static(b"{}");
 
-            let request = builder.body(body).unwrap();
+            let request = builder.body(body.into_http_body()).unwrap();
             let mut required_headers =
                 VecSignedHeaderRequirements::new(&["Content-Type", "Qwerty"], &["Foo", "Bar", "ETag"], &["x-amz"]);
             required_headers.remove_always_present("QWERTY");
@@ -723,7 +752,7 @@ mod tests {
             .header("Host", "example.amazonaws.com")
             .header("X-Amz-Date", "20150830T123600Z")
             .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, Signature=444cab3690e122afc941d086f06cfbc82c1b4f5c553e32ac81e7629a82ff3831, SignedHeaders=host;x-amz-date")
-            .body(())
+            .body(().into_http_body())
             .unwrap();
 
         assert!(sigv4_validate_request(
@@ -745,7 +774,7 @@ mod tests {
             .header("Host", "example.amazonaws.com")
             .header("X-Amz-Date", "20150830T123600Z")
             .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, Signature=b475de2c96e7bfdfe03bd784d948218730ef62f48ac8bb9f2922af9a44f8657c, SignedHeaders=host;x-amz-date")
-            .body(())
+            .body(().into_http_body())
             .unwrap();
 
         assert!(sigv4_validate_request(

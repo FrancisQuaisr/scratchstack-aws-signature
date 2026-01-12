@@ -128,6 +128,7 @@ mod crypto;
 mod error;
 mod signature;
 mod signing_key;
+mod stored_body;
 
 pub mod auth;
 pub mod canonical;

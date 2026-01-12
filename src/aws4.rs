@@ -1,7 +1,7 @@
 use {
     crate::{
         canonical::CanonicalRequest, service_for_signing_key_fn, sigv4_validate_request, GetSigningKeyRequest,
-        GetSigningKeyResponse, KSecretKey, SignatureOptions, NO_ADDITIONAL_SIGNED_HEADERS,
+        GetSigningKeyResponse, IntoHttpBody, KSecretKey, SignatureOptions, NO_ADDITIONAL_SIGNED_HEADERS,
     },
     bytes::{Bytes, BytesMut},
     chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc},
@@ -209,11 +209,10 @@ async fn run(basename: &str) {
 
     // Read the signed request file and generate our request format from it.
     let sreq = File::open(&sreq_path).expect(&format!("Failed to open {:?}", sreq_path));
-    let request = parse_file(sreq, &sreq_path);
-    let (parts, body) = request.into_parts();
-    let (canonical, parts, body) =
-        CanonicalRequest::from_request_parts(parts, body, SignatureOptions::url_encode_form())
-            .expect("Failed to parse request");
+    let request = parse_file(sreq, &sreq_path).map(Bytes::into_http_body);
+    let (canonical, request) = CanonicalRequest::from_request_parts(request, SignatureOptions::url_encode_form())
+        .await
+        .expect("Failed to parse request");
 
     // The canonical request calculated by AWS for verification.
     let mut creq_path = PathBuf::new();
@@ -271,8 +270,7 @@ async fn run(basename: &str) {
     );
 
     // Create a GetSigningKeyRequest from our existing request.
-    debug!("body: {:?}", body);
-    let request = Request::from_parts(parts, body);
+    debug!("body: {:?}", request.body());
     sigv4_validate_request(
         request,
         TEST_REGION,
